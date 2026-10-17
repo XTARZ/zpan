@@ -136,21 +136,55 @@ jobs:
           # Determine binding to write into wrangler.toml:
           # - Prefer KV_BINDING_NAME env if provided
           # - Else pick the first binding in wrangler.toml (binding = "...")
-          BINDING="${KV_BINDING_NAME:-$(awk -F= '/binding/ {gsub(/ /,\"\",$2); gsub(/\"/,\"\",$2); print $2; exit}' wrangler.toml || echo "KV_NAMESPACE")}"
+          if [ -n "${KV_BINDING_NAME:-}" ]; then
+            BINDING="$KV_BINDING_NAME"
+          else
+            if [ -f wrangler.toml ]; then
+              # single-quoted awk program avoids complex escaping issues
+              BINDING=$(awk -F= '/binding/ { gsub(/ /,"",$2); gsub(/"/,"",$2); print $2; exit }' wrangler.toml || echo "KV_NAMESPACE")
+            else
+              BINDING="KV_NAMESPACE"
+            fi
+          fi
           echo "Using binding name: $BINDING"
 
           # If a matching binding block exists, insert/replace id; otherwise append a new [[kv_namespaces]] block.
-          if grep -q "binding = \"$BINDING\"" wrangler.toml; then
-            # Use perl to safely insert or replace the id field inside the block for this binding.
-            perl -0777 -pe 's/(binding = "'$BINDING'"\s*\n(?:[^\[]*\n)*?)(id = ".*"\s*\n)?/$1id = "'$KV_ID'"\n/s' -i wrangler.toml
+          if grep -qE "binding[[:space:]]*=[[:space:]]*\"$BINDING\"" wrangler.toml; then
+            echo "Found existing binding in wrangler.toml; updating id for binding $BINDING"
+            # Try to replace an existing id line inside the kv_namespaces block for this binding.
+            awk -v b="$BINDING" -v id="$KV_ID" '
+              /^\[\[kv_namespaces\]\]/{ in_block=1; print; next }
+              in_block && $0 ~ /^binding[[:space:]]*=/ {
+                print
+                if ($0 ~ b) { in_target=1 } else { in_target=0 }
+                next
+              }
+              in_block && in_target && $0 ~ /^id[[:space:]]*=/ {
+                print "id = \"" id "\""
+                in_target=0
+                changed=1
+                next
+              }
+              { print }
+            ' wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
+
+            # If there was no id line inserted (some blocks may lack it), insert id directly after the binding line.
+            if ! awk -v b="$BINDING" 'BEGIN{found=0} $0 ~ "binding = \"" b "\""{ found=1 } END{ exit !found }' wrangler.toml; then
+              # fallback: ensure id exists right after binding occurrence
+              awk -v b="$BINDING" -v id="$KV_ID" '
+                { print }
+                $0 ~ "binding = \"" b "\"" && !inserted { print "id = \"" id "\""; inserted=1 }
+              ' wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
+            fi
+
             echo "Patched wrangler.toml for binding $BINDING"
           else
+            echo "Appending new [[kv_namespaces]] block for binding $BINDING"
             cat >> wrangler.toml <<EOF
-
-            [[kv_namespaces]]
-              binding = "$BINDING"
-              id = "$KV_ID"
-              EOF
+[[kv_namespaces]]
+binding = "$BINDING"
+id = "$KV_ID"
+EOF
             echo "Appended new [[kv_namespaces]] block with binding $BINDING"
           fi
 
@@ -270,8 +304,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           pnpm exec wrangler d1 execute zpan-db --remote --command \
-            "INSERT INTO system_options (key, value) VALUES ('webdav_verified_origin', ''), ('webdav_verified_at', ''), ('webdav_verification_error', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-
+            "INSERT INTO system_options (key, value) VALUES ('webdav_verified_origin', ''), ('webdav_verified_at', ''), ('webdav_verification_error', '') ON CONFLICT(key) DO UPDATE SET value = ex[...]
+      
       - name: Reconcile fixed WebDAV domain
         id: webdav
         env:
@@ -295,5 +329,5 @@ jobs:
           fi
           VERIFIED_AT=$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')
           pnpm exec wrangler d1 execute zpan-db --remote --command \
-            "INSERT INTO system_options (key, value) VALUES ('webdav_verified_origin', '$WEBDAV_ORIGIN'), ('webdav_verified_at', '$VERIFIED_AT'), ('webdav_verification_error', '') ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            "INSERT INTO system_options (key, value) VALUES ('webdav_verified_origin', '$WEBDAV_ORIGIN'), ('webdav_verified_at', '$VERIFIED_AT'), ('webdav_verification_error', '') ON CONFLICT(key[...]
           echo "WebDAV readiness recorded for $WEBDAV_ORIGIN" >> "$GITHUB_STEP_SUMMARY"
