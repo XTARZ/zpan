@@ -94,6 +94,66 @@ jobs:
           fi
           echo "id=$DB_ID" >> "$GITHUB_OUTPUT"
 
+      - name: Ensure KV namespace exists
+        id: kv
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Optional overrides (set as repo secrets or env if you want specific names)
+          # KV_NAMESPACE_TITLE: 'custom-kv-title'
+          # KV_BINDING_NAME: 'MY_KV_BINDING'
+        run: |
+          set -euo pipefail
+
+          # Title selection: prefer explicit env KV_NAMESPACE_TITLE, else fallback to "<repo>-kv"
+          TITLE="${KV_NAMESPACE_TITLE:-$(echo "${GITHUB_REPOSITORY}" | cut -d'/' -f2)-kv}"
+          echo "KV namespace title: $TITLE"
+
+          # Try to find existing namespace by title
+          KV_ID=$(curl -sf "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            | jq -r --arg t "$TITLE" '.result[]? | select(.title == $t) | .id' || true)
+
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "Creating KV namespace: $TITLE"
+            KV_ID=$(curl -sf -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\":\"$TITLE\"}" \
+              | jq -r '.result.id')
+            echo "Created KV namespace: $KV_ID"
+          else
+            echo "Reusing KV namespace: $KV_ID"
+          fi
+
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "::error::Failed to obtain KV namespace ID"
+            exit 1
+          fi
+          echo "id=$KV_ID" >> "$GITHUB_OUTPUT"
+
+          # Determine binding to write into wrangler.toml:
+          # - Prefer KV_BINDING_NAME env if provided
+          # - Else pick the first binding in wrangler.toml (binding = "...")
+          BINDING="${KV_BINDING_NAME:-$(awk -F= '/binding/ {gsub(/ /,\"\",$2); gsub(/\"/,\"\",$2); print $2; exit}' wrangler.toml || echo "KV_NAMESPACE")}"
+          echo "Using binding name: $BINDING"
+
+          # If a matching binding block exists, insert/replace id; otherwise append a new [[kv_namespaces]] block.
+          if grep -q "binding = \"$BINDING\"" wrangler.toml; then
+            # Use perl to safely insert or replace the id field inside the block for this binding.
+            perl -0777 -pe 's/(binding = "'$BINDING'"\s*\n(?:[^\[]*\n)*?)(id = ".*"\s*\n)?/$1id = "'$KV_ID'"\n/s' -i wrangler.toml
+            echo "Patched wrangler.toml for binding $BINDING"
+          else
+            cat >> wrangler.toml <<EOF
+
+            [[kv_namespaces]]
+              binding = "$BINDING"
+              id = "$KV_ID"
+              EOF
+            echo "Appended new [[kv_namespaces]] block with binding $BINDING"
+          fi
+
       - name: Ensure Queue exists
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -121,7 +181,7 @@ jobs:
           EXISTS=$(curl -sf \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
-            | jq -r '.result.buckets[]? | select(.name == "zpan-public-images") | .name')
+            | jq -r '.result.buckets[]? | select(..name == "zpan-public-images") | .name')
           if [ -z "$EXISTS" ]; then
             curl -sf -X POST \
               "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/r2/buckets" \
