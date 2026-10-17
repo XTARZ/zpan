@@ -180,11 +180,11 @@ jobs:
             echo "Patched wrangler.toml for binding $BINDING"
           else
             echo "Appending new [[kv_namespaces]] block for binding $BINDING"
-            cat >> wrangler.toml <<EOF
-[[kv_namespaces]]
-binding = "$BINDING"
-id = "$KV_ID"
-EOF
+            {
+              printf '%s\n' '[[kv_namespaces]]'
+              printf 'binding = "%s"\n' "$BINDING"
+              printf 'id = "%s"\n' "$KV_ID"
+            } >> wrangler.toml
             echo "Appended new [[kv_namespaces]] block with binding $BINDING"
           fi
 
